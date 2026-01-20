@@ -60,7 +60,7 @@ class ChatParams: public oatpp::DTO {
     DTO_FIELD(String, model);
     // These are actually json but we use nlohmann/json for them
     DTO_FIELD(Vector<Object<ChatMessage>>, messages);
-    DTO_FIELD(String, tools);
+    DTO_FIELD(Any, tools);  // Changed from String to Any to support JSON array/object
 
     DTO_FIELD(String, format);
     DTO_FIELD(Object<ModelParameters>, options);

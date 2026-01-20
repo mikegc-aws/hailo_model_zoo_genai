@@ -592,6 +592,23 @@ MyController::chat(const oatpp::Object<ChatParams>& generation_params) {
         json::parse(m_contentMappers->getDefaultMapper()
                         ->writeToString(generation_params->messages)
                         .getValue(""));
+    
+    // Extract and parse tools if provided
+    if (generation_params->tools) {
+        const auto tools_str = m_contentMappers->getDefaultMapper()
+                                   ->writeToString(generation_params->tools)
+                                   .getValue("");
+        if (!tools_str.empty()) {
+            try {
+                inputs.tools = json::parse(tools_str);
+            } catch (const json::parse_error& e) {
+                OATPP_LOGw("chat", "Failed to parse tools JSON: {}", e.what());
+                inputs.tools = json::array();  // Default to empty array on parse error
+            }
+        }
+    } else {
+        inputs.tools = json::array();  // Default to empty array if not provided
+    }
 
     const std::string prompt_templ = templ.apply(inputs);
 
