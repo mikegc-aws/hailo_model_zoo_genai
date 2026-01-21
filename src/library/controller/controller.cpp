@@ -152,6 +152,246 @@ MyController::convert_keep_alive(const oatpp::Int32& keep_alive) {
     }
 }
 
+std::pair<std::string, oatpp::Vector<oatpp::Object<ToolCall>>>
+MyController::parse_tool_calls(const std::string& response) {
+    auto tool_calls = oatpp::Vector<oatpp::Object<ToolCall>>::createShared();
+    std::string cleaned_content = response;
+
+    // Helper to convert nlohmann::json to oatpp::Any so that arguments serialize as an object
+    std::function<oatpp::Any(const json&)> json_to_any = [&](const json& j) -> oatpp::Any {
+        if (j.is_object()) {
+            auto map = oatpp::Fields<oatpp::Any>::createShared();
+            for (auto it = j.cbegin(); it != j.cend(); ++it) {
+                map[it.key()] = json_to_any(it.value());
+            }
+            return map;
+        }
+        if (j.is_array()) {
+            auto vec = oatpp::Vector<oatpp::Any>::createShared();
+            for (const auto& v : j) {
+                vec->push_back(json_to_any(v));
+            }
+            return vec;
+        }
+        if (j.is_string()) {
+            return oatpp::Any(oatpp::String(j.get<std::string>().c_str()));
+        }
+        if (j.is_boolean()) {
+            return oatpp::Any(oatpp::Boolean(j.get<bool>()));
+        }
+        if (j.is_number_integer()) {
+            return oatpp::Any(oatpp::Int64(j.get<long long>()));
+        }
+        if (j.is_number_unsigned()) {
+            return oatpp::Any(oatpp::Int64(static_cast<long long>(j.get<unsigned long long>())));
+        }
+        if (j.is_number_float()) {
+            return oatpp::Any(oatpp::Float64(j.get<double>()));
+        }
+        // null
+        return oatpp::Any(nullptr);
+    };
+    
+    // Look for <tool_call>...</tool_call> tags
+    const std::string open_tag = "<tool_call>";
+    const std::string close_tag = "</tool_call>";
+    
+    size_t pos = 0;
+    size_t call_id = 0;
+    
+    while ((pos = cleaned_content.find(open_tag, pos)) != std::string::npos) {
+        size_t tag_start = pos;
+        size_t content_start = pos + open_tag.length();
+        size_t tag_end = cleaned_content.find(close_tag, content_start);
+        
+        if (tag_end == std::string::npos) {
+            // Malformed - no closing tag, skip
+            break;
+        }
+        
+        // Extract JSON content between tags
+        std::string json_content = cleaned_content.substr(
+            content_start,
+            tag_end - content_start
+        );
+        
+        // Trim whitespace
+        json_content.erase(0, json_content.find_first_not_of(" \t\n\r"));
+        json_content.erase(json_content.find_last_not_of(" \t\n\r") + 1);
+        
+        try {
+            // Parse the JSON
+            auto tool_call_json = json::parse(json_content);
+            
+            if (tool_call_json.contains("name") && tool_call_json.contains("arguments")) {
+                auto tool_call = ToolCall::createShared();
+                // Generate id if missing (for compatibility with clients that don't preserve it)
+                if (tool_call_json.contains("id")) {
+                    tool_call->id = tool_call_json["id"].get<std::string>();
+                } else {
+                    tool_call->id = "call_" + std::to_string(call_id++);
+                }
+                tool_call->type = "function";
+                
+                auto function = ToolCallFunction::createShared();
+                // Generate index if missing (for compatibility with clients that don't preserve it)
+                if (tool_call_json.contains("function") && tool_call_json["function"].is_object()) {
+                    const auto& func_obj = tool_call_json["function"];
+                    if (func_obj.contains("index")) {
+                        function->index = static_cast<oatpp::Int32>(func_obj["index"].get<int>());
+                    } else {
+                        function->index = static_cast<oatpp::Int32>(tool_calls->size());
+                    }
+                    if (func_obj.contains("name")) {
+                        function->name = func_obj["name"].get<std::string>();
+                    } else {
+                        function->name = tool_call_json["name"].get<std::string>();
+                    }
+                    if (func_obj.contains("arguments")) {
+                        function->arguments = json_to_any(func_obj["arguments"]);
+                    } else {
+                        function->arguments = json_to_any(tool_call_json["arguments"]);
+                    }
+                } else {
+                    // Legacy format: name and arguments at top level
+                    function->index = static_cast<oatpp::Int32>(tool_calls->size());
+                    function->name = tool_call_json["name"].get<std::string>();
+                    function->arguments = json_to_any(tool_call_json["arguments"]);
+                }
+                
+                tool_call->function = function;
+                tool_calls->push_back(tool_call);
+            }
+        } catch (const json::parse_error& e) {
+            OATPP_LOGw("parse_tool_calls", "Failed to parse tool call JSON: {}", e.what());
+        }
+        
+        // Remove the tool_call tag from cleaned content
+        cleaned_content.erase(tag_start, tag_end + close_tag.length() - tag_start);
+        pos = tag_start;  // Check from this position again
+    }
+
+    // Fallback parsing: detect inline JSON function calls without <tool_call> tags
+    // Example the model might emit:
+    // {"function": "current_time", "arguments": {}}
+    // or {"name": "current_time", "arguments": {}}
+    auto try_parse_inline_tool = [&](const std::string& json_str) {
+        try {
+            auto obj = json::parse(json_str);
+            std::string name;
+            json arguments = json::object();
+
+            if (obj.contains("function") && obj["function"].is_string()) {
+                name = obj["function"].get<std::string>();
+            } else if (obj.contains("name") && obj["name"].is_string()) {
+                name = obj["name"].get<std::string>();
+            }
+            if (obj.contains("arguments")) {
+                arguments = obj["arguments"];
+            } else if (obj.contains("parameters")) {
+                arguments = obj["parameters"];
+            }
+            if (!name.empty()) {
+                auto tool_call = ToolCall::createShared();
+                // Generate id if missing
+                if (obj.contains("id")) {
+                    tool_call->id = obj["id"].get<std::string>();
+                } else {
+                    tool_call->id = "call_" + std::to_string(tool_calls->size());
+                }
+                tool_call->type = "function";
+
+                auto function = ToolCallFunction::createShared();
+                // Generate index if missing
+                if (obj.contains("function") && obj["function"].is_object()) {
+                    const auto& func_obj = obj["function"];
+                    if (func_obj.contains("index")) {
+                        function->index = static_cast<oatpp::Int32>(func_obj["index"].get<int>());
+                    } else {
+                        function->index = static_cast<oatpp::Int32>(tool_calls->size());
+                    }
+                } else {
+                    function->index = static_cast<oatpp::Int32>(tool_calls->size());
+                }
+                function->name = name;
+                function->arguments = json_to_any(arguments);
+                tool_call->function = function;
+                tool_calls->push_back(tool_call);
+                return true;
+            }
+        } catch (const std::exception& e) {
+            // ignore
+        }
+        return false;
+    };
+
+    // Try to find JSON blocks in the cleaned_content by scanning for balanced braces
+    auto find_balanced_json = [](const std::string& text, size_t start_pos) -> std::optional<std::pair<size_t, size_t>> {
+        bool in_string = false;
+        bool escape = false;
+        int depth = 0;
+        for (size_t i = start_pos; i < text.size(); ++i) {
+            char c = text[i];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '\"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (c == '{') {
+                if (depth == 0) {
+                    start_pos = i;
+                }
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return std::make_pair(start_pos, i);
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    size_t search_pos = 0;
+    while (true) {
+        auto brace_pos = cleaned_content.find('{', search_pos);
+        if (brace_pos == std::string::npos) {
+            break;
+        }
+        auto json_range = find_balanced_json(cleaned_content, brace_pos);
+        if (!json_range) {
+            break;
+        }
+        auto [start, end] = *json_range;
+        std::string candidate = cleaned_content.substr(start, end - start + 1);
+        if (try_parse_inline_tool(candidate)) {
+            // Remove parsed JSON from content
+            cleaned_content.erase(start, end - start + 1);
+            search_pos = start;  // continue from here
+        } else {
+            search_pos = end + 1;
+        }
+    }
+    
+    // Clean up any remaining whitespace/newlines
+    while (!cleaned_content.empty() && 
+           (cleaned_content.back() == '\n' || cleaned_content.back() == ' ' || cleaned_content.back() == '\r')) {
+        cleaned_content.pop_back();
+    }
+    
+    return {cleaned_content, tool_calls};
+}
+
 std::shared_ptr<oat::OutgoingResponse> MyController::handle_completion(
     const ModelInfo& model_data,
     const std::string& raw_prompt,
@@ -253,6 +493,10 @@ std::shared_ptr<oat::OutgoingResponse> MyController::handle_completion(
             std::chrono::steady_clock::now();
         std::string stop_reason = stop_token_encountered ? "stop" : "length";
 
+        // Parse tool calls from response
+        auto [cleaned_content, tool_calls] = MyController::parse_tool_calls(response.str());
+        bool has_tool_calls = tool_calls && tool_calls->size() > 0;
+
         if (return_type == ReturnType::COMPLETION) {
             auto result = CreateChatCompletionResponse::createShared();
             result->id = "chatcmpl-" + std::to_string(std::rand());
@@ -265,11 +509,11 @@ std::shared_ptr<oat::OutgoingResponse> MyController::handle_completion(
 
             auto message = ChatCompletionMessage::createShared();
             message->role = "assistant";
-            message->content = response.str();
+            message->content = cleaned_content;
 
             auto choice = ChatChoice::createShared();
             choice->index = 0L;
-            choice->finish_reason = std::move(stop_reason);
+            choice->finish_reason = has_tool_calls ? "tool_calls" : std::move(stop_reason);
             choice->message = message;
 
             result->choices->push_back(choice);
@@ -281,19 +525,31 @@ std::shared_ptr<oat::OutgoingResponse> MyController::handle_completion(
         if (return_type == ReturnType::MESSAGE) {
             result->message = ChatMessage::createShared();
             result->message->role = "assistant";
-            result->message->content = response.str();
+            // When tool_calls are present, content must be empty string per Ollama API spec
+            if (has_tool_calls) {
+                result->message->content = "";
+                result->message->tool_calls = tool_calls;
+            } else {
+                result->message->content = cleaned_content;
+            }
         } else {
-            result->response = response.str();
+            result->response = cleaned_content;
         }
         generator->append_last_prompt(response.str());
 
         result->done = true;
-        result->done_reason = std::move(stop_reason);
+        result->done_reason = has_tool_calls ? "tool_calls" : std::move(stop_reason);
         const auto total_time_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                 .count();
         result->total_duration = total_time_ns;
         result->eval_count = token_count;
+        // Explicitly set prompt_eval_count to 0 to ensure it's never null
+        result->prompt_eval_count = 0UL;
+        // Set other optional metadata fields to 0 to ensure they're never null
+        result->load_duration = 0UL;
+        result->eval_duration = 0UL;
+        result->prompt_eval_duration = 0UL;
 
         return createDtoResponse(Status::CODE_200, result);
     }
@@ -588,29 +844,187 @@ MyController::chat(const oatpp::Object<ChatParams>& generation_params) {
 
     minja::chat_template_inputs inputs;
     inputs.add_generation_prompt = true;
-    inputs.messages =
-        json::parse(m_contentMappers->getDefaultMapper()
-                        ->writeToString(generation_params->messages)
-                        .getValue(""));
+    
+    // Normalize tool_calls in DTO before serialization to avoid invalid JSON
+    // Some clients (like Strands) don't preserve id and index fields
+    if (generation_params->messages) {
+        for (auto& message : *generation_params->messages) {
+            if (message && message->tool_calls) {
+                size_t tool_call_index = 0;
+                for (auto& tool_call : *message->tool_calls) {
+                    if (tool_call) {
+                        // Generate id if missing
+                        if (!tool_call->id || tool_call->id->empty()) {
+                            tool_call->id = "call_" + std::to_string(tool_call_index);
+                            OATPP_LOGi("chat", "Added missing id to tool_call: {}", tool_call->id->c_str());
+                        }
+                        // Generate function.index if missing
+                        if (tool_call->function) {
+                            if (!tool_call->function->index) {
+                                tool_call->function->index = static_cast<oatpp::Int32>(tool_call_index);
+                                OATPP_LOGi("chat", "Added missing index to tool_call function: {}", tool_call_index);
+                            }
+                        }
+                    }
+                    ++tool_call_index;
+                }
+            }
+        }
+    }
+    
+    // Parse messages with error handling and detailed logging
+    try {
+        const auto messages_str = m_contentMappers->getDefaultMapper()
+                                    ->writeToString(generation_params->messages)
+                                    .getValue("");
+        OATPP_LOGi("chat", "Messages JSON string length: {}", messages_str.length());
+        
+        // Log a snippet of the JSON for debugging (first 500 chars and last 200 chars)
+        if (messages_str.length() > 500) {
+            OATPP_LOGi("chat", "Messages JSON start: {}", messages_str.substr(0, 500));
+            OATPP_LOGi("chat", "Messages JSON end: {}", messages_str.substr(messages_str.length() - 200));
+        } else {
+            OATPP_LOGi("chat", "Messages JSON full: {}", messages_str);
+        }
+        
+        // If error occurs around column 325, log that region
+        if (messages_str.length() > 325) {
+            size_t start = (325 > 100) ? 325 - 100 : 0;
+            size_t len = std::min(static_cast<size_t>(200), messages_str.length() - start);
+            OATPP_LOGi("chat", "Messages JSON around column 325: {}", messages_str.substr(start, len));
+        }
+        
+        inputs.messages = json::parse(messages_str);
+        OATPP_LOGi("chat", "Successfully parsed {} messages", inputs.messages.size());
+        
+        // Normalize messages: ensure content field exists when tool_calls are present
+        // Per Ollama spec: content must be "" (empty string) when tool_calls are present
+        for (auto& message : inputs.messages) {
+            if (message.contains("tool_calls") && message["tool_calls"].is_array() && !message["tool_calls"].empty()) {
+                // If tool_calls are present, ensure content field exists (even if empty)
+                if (!message.contains("content") || message["content"].is_null()) {
+                    message["content"] = "";
+                    OATPP_LOGi("chat", "Added missing content field (empty string) to message with tool_calls");
+                }
+            }
+        }
+        
+        // Normalize tool_calls: add missing id and index fields for compatibility
+        // Some clients (like Strands) don't preserve these fields when sending tool_calls back
+        for (auto& message : inputs.messages) {
+            if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
+                size_t tool_call_index = 0;
+                for (auto& tool_call : message["tool_calls"]) {
+                    // Add id if missing
+                    if (!tool_call.contains("id") || tool_call["id"].is_null()) {
+                        tool_call["id"] = "call_" + std::to_string(tool_call_index);
+                        OATPP_LOGi("chat", "Added missing id to tool_call: {}", tool_call["id"].dump());
+                    }
+                    // Add function.index if missing
+                    if (tool_call.contains("function") && tool_call["function"].is_object()) {
+                        auto& func = tool_call["function"];
+                        if (!func.contains("index") || func["index"].is_null()) {
+                            func["index"] = static_cast<int>(tool_call_index);
+                            OATPP_LOGi("chat", "Added missing index to tool_call function: {}", tool_call_index);
+                        }
+                    }
+                    ++tool_call_index;
+                }
+            }
+        }
+        
+        // Log message roles for debugging
+        for (size_t i = 0; i < inputs.messages.size(); ++i) {
+            if (inputs.messages[i].contains("role")) {
+                OATPP_LOGi("chat", "Message {}: role={}", i, inputs.messages[i]["role"].dump());
+                if (inputs.messages[i].contains("tool_calls")) {
+                    OATPP_LOGi("chat", "Message {} has tool_calls: {}", i, inputs.messages[i]["tool_calls"].dump());
+                }
+                if (inputs.messages[i].contains("name")) {
+                    OATPP_LOGi("chat", "Message {} has name: {}", i, inputs.messages[i]["name"].dump());
+                }
+            }
+        }
+    } catch (const json::parse_error& e) {
+        OATPP_LOGe("chat", "Failed to parse messages JSON: {} at position {} (line {}, column {})", 
+                   e.what(), e.byte, e.id, e.byte);
+        
+        // Log the problematic region
+        const auto messages_str = m_contentMappers->getDefaultMapper()
+                                    ->writeToString(generation_params->messages)
+                                    .getValue("");
+        if (messages_str.length() > e.byte) {
+            size_t start = (e.byte > 100) ? e.byte - 100 : 0;
+            size_t len = std::min(static_cast<size_t>(200), messages_str.length() - start);
+            OATPP_LOGe("chat", "JSON around error position {}: {}", e.byte, messages_str.substr(start, len));
+        }
+        
+        auto error_result = ErrorResponse::createShared();
+        error_result->error = "Failed to parse messages: " + std::string(e.what()) + 
+                             " at position " + std::to_string(e.byte);
+        return createDtoResponse(Status::CODE_400, error_result);
+    } catch (const std::exception& e) {
+        OATPP_LOGe("chat", "Error processing messages: {}", e.what());
+        auto error_result = ErrorResponse::createShared();
+        error_result->error = "Error processing messages: " + std::string(e.what());
+        return createDtoResponse(Status::CODE_400, error_result);
+    }
     
     // Extract and parse tools if provided
     if (generation_params->tools) {
         const auto tools_str = m_contentMappers->getDefaultMapper()
                                    ->writeToString(generation_params->tools)
                                    .getValue("");
-        if (!tools_str.empty()) {
+        OATPP_LOGi("chat", "Tools string from DTO: {}", tools_str);
+        if (!tools_str.empty() && tools_str != "null") {
             try {
-                inputs.tools = json::parse(tools_str);
+                auto parsed_tools = json::parse(tools_str);
+                OATPP_LOGi("chat", "Successfully parsed {} tools", parsed_tools.size());
+                
+                // Transform Ollama format tools to the format expected by templates
+                // Ollama format: [{"type":"function","function":{"name":"...","description":"...","parameters":{}}}]
+                // Template expects: array of tool objects (can be in various formats)
+                inputs.tools = json::array();
+                if (parsed_tools.is_array()) {
+                    for (const auto& tool : parsed_tools) {
+                        // If tool has "function" nested, extract it; otherwise use as-is
+                        if (tool.is_object() && tool.contains("function")) {
+                            // Extract the function object which contains name, description, parameters
+                            inputs.tools.push_back(tool["function"]);
+                        } else {
+                            // Use tool as-is
+                            inputs.tools.push_back(tool);
+                        }
+                    }
+                }
+                OATPP_LOGi("chat", "Transformed to {} tools for template", inputs.tools.size());
+                if (inputs.tools.is_array() && inputs.tools.size() > 0) {
+                    OATPP_LOGi("chat", "First transformed tool: {}", inputs.tools[0].dump());
+                }
             } catch (const json::parse_error& e) {
-                OATPP_LOGw("chat", "Failed to parse tools JSON: {}", e.what());
+                OATPP_LOGw("chat", "Failed to parse tools JSON: {} - Raw string: {}", e.what(), tools_str);
                 inputs.tools = json::array();  // Default to empty array on parse error
             }
+        } else {
+            OATPP_LOGw("chat", "Tools string is empty or null");
+            inputs.tools = json::array();
         }
     } else {
+        OATPP_LOGi("chat", "No tools field in request");
         inputs.tools = json::array();  // Default to empty array if not provided
     }
 
     const std::string prompt_templ = templ.apply(inputs);
+    OATPP_LOGi("chat", "Generated prompt length: {} chars", prompt_templ.length());
+    // Log a snippet of the prompt to verify tools are included
+    if (prompt_templ.find("<tools>") != std::string::npos) {
+        size_t tools_start = prompt_templ.find("<tools>");
+        size_t tools_end = prompt_templ.find("</tools>", tools_start);
+        if (tools_end != std::string::npos) {
+            std::string tools_section = prompt_templ.substr(tools_start, tools_end + 8 - tools_start);
+            OATPP_LOGi("chat", "Tools section in prompt: {}", tools_section);
+        }
+    }
 
     return handle_completion(
         model_data,

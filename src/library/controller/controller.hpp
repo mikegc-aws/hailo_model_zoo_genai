@@ -127,6 +127,10 @@ class MyController: public oatpp::web::server::api::ApiController {
     static std::optional<std::chrono::seconds>
     convert_keep_alive(const oatpp::Int32& keep_alive);
 
+  public:
+    static std::pair<std::string, oatpp::Vector<oatpp::Object<ToolCall>>>
+    parse_tool_calls(const std::string& response);
+
   private:
     std::shared_ptr<SyncGenerationContext> m_generation_context;
     std::shared_ptr<ModelStore> m_model_store;

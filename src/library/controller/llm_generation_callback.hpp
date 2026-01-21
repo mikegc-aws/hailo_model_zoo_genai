@@ -52,4 +52,6 @@ class LLMGenerationReadCallback: public oatpp::data::stream::ReadCallback {
     uint64_t m_count;
     bool m_done;
     std::stringstream m_response;
+    bool m_tool_call_detected;
+    bool m_sending_tool_calls;
 };

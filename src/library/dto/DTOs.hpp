@@ -47,11 +47,30 @@ class GenerationParams: public oatpp::DTO {
     DTO_FIELD(Int32, keep_alive);
 };
 
+class ToolCallFunction: public oatpp::DTO {
+    DTO_INIT(ToolCallFunction, DTO)
+
+    DTO_FIELD(Int32, index);  // Optional - will be generated if missing for compatibility
+    DTO_FIELD(String, name);
+    // Use Any so arguments can be a JSON object (not just a string)
+    DTO_FIELD(Any, arguments);
+};
+
+class ToolCall: public oatpp::DTO {
+    DTO_INIT(ToolCall, DTO)
+
+    DTO_FIELD(String, id);  // Optional - will be generated if missing for compatibility
+    DTO_FIELD(String, type) = "function";
+    DTO_FIELD(Object<ToolCallFunction>, function);
+};
+
 class ChatMessage: public oatpp::DTO {
     DTO_INIT(ChatMessage, DTO)
 
     DTO_FIELD(String, role);
     DTO_FIELD(String, content);
+    DTO_FIELD(Vector<Object<ToolCall>>, tool_calls);
+    DTO_FIELD(String, name);  // Optional: for tool messages (tool name)
 };
 
 class ChatParams: public oatpp::DTO {
