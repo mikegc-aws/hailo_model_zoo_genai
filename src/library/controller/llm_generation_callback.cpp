@@ -67,13 +67,6 @@ oatpp::v_io_size LLMGenerationReadCallback::read(
     if (!(m_generator_completion.generation_status()
           != GenerationStatus::GENERATING)) {
         m_response << token;
-        
-        // Check if we're starting to generate a tool call
-        std::string current_response = m_response.str();
-        if (!m_tool_call_detected && current_response.find("<tool_call>") != std::string::npos) {
-            m_tool_call_detected = true;
-            m_sending_tool_calls = true;
-        }
     }
     // check if encountered a stop token
     const auto stop_token_it =
@@ -108,7 +101,7 @@ oatpp::v_io_size LLMGenerationReadCallback::read(
             std::chrono::duration_cast<std::chrono::nanoseconds>(end - m_begin)
                 .count();
         
-        // Parse tool calls from accumulated response
+        // Parse tool calls from accumulated response (for tool_calls detection)
         auto [cleaned_content, tool_calls] = MyController::parse_tool_calls(m_response.str());
         bool has_tool_calls = tool_calls && tool_calls->size() > 0;
         
@@ -118,15 +111,16 @@ oatpp::v_io_size LLMGenerationReadCallback::read(
         if (m_return_as_message) {
             result->message = ChatMessage::createShared();
             result->message->role = "assistant";
-            // When tool_calls are present, content must be empty string per Ollama API spec
+            // In streaming mode, content was already sent token-by-token
+            // Final chunk only has metadata (or tool_calls if present)
             if (has_tool_calls) {
                 result->message->content = "";
                 result->message->tool_calls = tool_calls;
             } else {
-                result->message->content = cleaned_content;
+                result->message->content = "";  // Empty - all tokens already streamed
             }
         } else {
-            result->response = cleaned_content;
+            result->response = "";  // Empty - all tokens already streamed
         }
         result->done = true;
         result->done_reason = has_tool_calls ? "tool_calls" : stop_reason;
@@ -148,22 +142,6 @@ oatpp::v_io_size LLMGenerationReadCallback::read(
     }
 
     ++m_count;
-    
-    // If we've detected a tool call starting, don't send content tokens in intermediate chunks
-    // Buffer everything and send tool_calls only in the final message
-    if (m_sending_tool_calls) {
-        // Check if tool call is complete by looking for closing tag
-        std::string current_response = m_response.str();
-        size_t tool_call_start = current_response.find("<tool_call>");
-        if (tool_call_start != std::string::npos) {
-            size_t tool_call_end = current_response.find("</tool_call>", tool_call_start);
-            if (tool_call_end == std::string::npos) {
-                // Tool call not complete yet, don't send anything
-                // Return empty response to keep the stream alive
-                return 0;
-            }
-        }
-    }
     
     auto result = GenerationResponse::createShared();
     result->model = m_model;
